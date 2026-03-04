@@ -19,7 +19,7 @@ interface PositionedCommit {
   x: number
   y: number
   lane: number
-  depth: number
+  row: number
 }
 
 interface GraphEdge {
@@ -99,40 +99,102 @@ function buildBranchLanes(
   return Object.fromEntries(ordered.map((name, index) => [name, index]))
 }
 
-function layoutCommits(
-  commits: GitCommit[],
-  branchLanes: Record<string, number>,
-): PositionedCommit[] {
-  const laneWidth = 160
-  const rowHeight = 120
+function topoSortNewestToOldest(commits: GitCommit[]): GitCommit[] {
   const commitById = new Map(commits.map((c) => [c.id, c]))
-  const depthCache = new Map<string, number>()
+  const indegree = new Map<string, number>()
+  commits.forEach((c) => indegree.set(c.id, 0))
 
-  const getDepth = (commit: GitCommit): number => {
-    const cached = depthCache.get(commit.id)
-    if (cached !== undefined) return cached
-    if (!commit.parents.length) {
-      depthCache.set(commit.id, 0)
-      return 0
+  for (const commit of commits) {
+    for (const parentId of commit.parents) {
+      if (!indegree.has(parentId)) continue
+      indegree.set(parentId, (indegree.get(parentId) ?? 0) + 1)
     }
-    const parentDepth = Math.max(
-      ...commit.parents.map((id) => {
-        const parent = commitById.get(id)
-        return parent ? getDepth(parent) : 0
-      }),
-    )
-    const depth = parentDepth + 1
-    depthCache.set(commit.id, depth)
-    return depth
   }
 
-  return commits.map((c) => {
-    const lane = branchLanes[c.branch] ?? Object.keys(branchLanes).length
-    const depth = getDepth(c)
-    const x = 120 + lane * laneWidth
-    const y = 60 + depth * rowHeight
-    return { commit: c, x, y, lane, depth }
+  const cmp = (a: GitCommit, b: GitCommit) => b.index - a.index || b.id.localeCompare(a.id)
+  const queue: GitCommit[] = commits
+    .filter((c) => (indegree.get(c.id) ?? 0) === 0)
+    .sort(cmp)
+
+  const ordered: GitCommit[] = []
+  while (queue.length) {
+    const next = queue.shift()!
+    ordered.push(next)
+
+    for (const parentId of next.parents) {
+      if (!indegree.has(parentId)) continue
+      const remaining = (indegree.get(parentId) ?? 0) - 1
+      indegree.set(parentId, remaining)
+      if (remaining === 0) {
+        queue.push(commitById.get(parentId)!)
+        queue.sort(cmp)
+      }
+    }
+  }
+
+  if (ordered.length !== commits.length) {
+    const missing = commits
+      .filter((c) => !ordered.some((o) => o.id === c.id))
+      .sort(cmp)
+    ordered.push(...missing)
+  }
+  return ordered
+}
+
+function layoutDag(commits: GitCommit[]): {
+  positioned: PositionedCommit[]
+  branchLanes: Record<string, number>
+} {
+  const laneWidth = 160
+  const rowHeight = 120
+  const ordered = topoSortNewestToOldest(commits)
+  const remainingByBranch = new Map<string, number>()
+  for (const c of ordered) {
+    remainingByBranch.set(c.branch, (remainingByBranch.get(c.branch) ?? 0) + 1)
+  }
+
+  const branchLane = new Map<string, number>()
+  const freeLanes: number[] = []
+  let nextLane = 0
+
+  const allocateLane = (): number => {
+    if (freeLanes.length) {
+      freeLanes.sort((a, b) => a - b)
+      return freeLanes.shift()!
+    }
+    const lane = nextLane
+    nextLane += 1
+    return lane
+  }
+
+  const positioned: PositionedCommit[] = ordered.map((commit, row) => {
+    const lane = branchLane.has(commit.branch)
+      ? branchLane.get(commit.branch)!
+      : (() => {
+          const allocated = allocateLane()
+          branchLane.set(commit.branch, allocated)
+          return allocated
+        })()
+
+    const remaining = (remainingByBranch.get(commit.branch) ?? 1) - 1
+    remainingByBranch.set(commit.branch, remaining)
+    if (remaining <= 0) {
+      freeLanes.push(lane)
+    }
+
+    return {
+      commit,
+      lane,
+      row,
+      x: lane * laneWidth,
+      y: row * rowHeight,
+    }
   })
+
+  return {
+    positioned,
+    branchLanes: Object.fromEntries(branchLane.entries()),
+  }
 }
 
 function buildEdges(positionedById: Map<string, PositionedCommit>, commits: GitCommit[]): GraphEdge[] {
@@ -174,7 +236,8 @@ function edgePath(edge: GraphEdge, offsetX: number, offsetY: number): string {
   if (edge.sameLane) {
     return `M ${x1} ${y1} L ${x2} ${y2}`
   }
-  return `M ${x1} ${y1} C ${x1} ${y1 + 44} ${x2} ${y2 - 44} ${x2} ${y2}`
+  const bend = Math.max(52, Math.abs(y2 - y1) * 0.36)
+  return `M ${x1} ${y1} C ${x1} ${y1 - bend} ${x2} ${y2 + bend} ${x2} ${y2}`
 }
 
 function toSnapshot(
@@ -197,14 +260,12 @@ export const GitGraph: React.FC<GitGraphProps> = ({ state, variant }) => {
   const { commits, branches, headBranch, lastAction } = normaliseCommits(state)
   const previousSnapshotRef = React.useRef<GraphSnapshot | null>(null)
 
-  const branchLanes = React.useMemo(
-    () => buildBranchLanes(commits, branches),
-    [commits, branches],
-  )
-  const positioned = React.useMemo(
-    () => layoutCommits(commits, branchLanes),
-    [commits, branchLanes],
-  )
+  const dagLayout = React.useMemo(() => layoutDag(commits), [commits])
+  const positioned = dagLayout.positioned
+  const branchLanes = React.useMemo(() => {
+    const known = buildBranchLanes(commits, branches)
+    return { ...known, ...dagLayout.branchLanes }
+  }, [commits, branches, dagLayout.branchLanes])
   const positionedById = React.useMemo(
     () => new Map(positioned.map((node) => [node.commit.id, node])),
     [positioned],
@@ -285,15 +346,18 @@ export const GitGraph: React.FC<GitGraphProps> = ({ state, variant }) => {
     return 0
   }
 
-  const maxDepth = positioned.reduce((m, p) => Math.max(m, p.depth), 0)
+  const maxRow = positioned.reduce((m, p) => Math.max(m, p.row), 0)
   const topPadding = 80
   const laneWidth = 160
   const rowHeight = 120
   const minX = positioned.length ? Math.min(...positioned.map((p) => p.x)) : 0
   const maxX = positioned.length ? Math.max(...positioned.map((p) => p.x)) : 0
-  const contentWidth = Math.max(1, maxX - minX + laneWidth * 0.5)
-  const graphWidth = Math.max(520, contentWidth + laneWidth * 2)
-  const graphHeight = Math.max(360, maxDepth * rowHeight + 200)
+  const contentWidth = Math.max(1, maxX - minX)
+  const graphWidth = Math.max(
+    520,
+    contentWidth + laneWidth * Math.max(2, Object.keys(branchLanes).length),
+  )
+  const graphHeight = Math.max(360, maxRow * rowHeight + 240)
   const offsetX = (graphWidth - contentWidth) / 2 - minX
   const offsetY = topPadding
 

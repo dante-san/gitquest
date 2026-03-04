@@ -21,6 +21,7 @@ export const CommitNode: React.FC<CommitNodeProps> = ({
   popDelay = 0,
 }) => {
   const nodeRadius = 12
+  const shortLabel = (commit.label || commit.id).slice(0, 4)
   const color =
     commit.branch === 'feature'
       ? '#22d3ee'
@@ -90,7 +91,7 @@ export const CommitNode: React.FC<CommitNodeProps> = ({
         className="text-[9px] font-mono"
         fill={variant === 'target' ? '#64748b' : '#cbd5f5'}
       >
-        {commit.label}
+        {shortLabel}
       </text>
     </motion.g>
   )
